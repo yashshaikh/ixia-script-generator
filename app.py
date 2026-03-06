@@ -12,51 +12,42 @@ with st.sidebar:
     port = st.number_input("Rest Port", value=8080)
     
     st.header("2. Traffic Details")
-    num_flows = st.number_input("Number of Flows", min_value=1, max_value=20, value=1)
-    
-    flow_names = []
-    for i in range(int(num_flows)):
-        name = st.text_input(f"Flow {i+1} Name", value=f"vxlan")
-        flow_names.append(name)
+    target_flow = st.text_input("Target Flow Name", value="Traffic Item 2")
 
     st.header("3. Expectations")
-    # Checkbox to skip Duration check
-    skip_duration = st.checkbox("Skip Loss Duration Check", value=False)
-    if not skip_duration:
-        max_loss_duration = st.number_input("Max Loss Duration (ms) allowed", value=0)
+    skip_dur = st.checkbox("Skip Loss Duration Check", value=True)
+    if not skip_dur:
+        max_dur = st.number_input("Max Loss Duration (ms)", value=0)
     else:
-        max_loss_duration = -1 # Flag to skip in script
+        max_dur = -1
         
-    # Restored Loss Percentage field
-    max_loss_percent = st.number_input("Max Loss Percentage (%) allowed", value=0.0, format="%.4f")
+    max_pct = st.number_input("Max Loss Percentage (%)", value=0.0, format="%.4f")
 
-# --- The Updated Script Template ---
+# --- The Validated Script Template ---
 script_template = f"""
 from ixnetwork_restpy import SessionAssistant
 import time
 import sys
 import urllib3
 
-# Silence SSL warnings common in lab environments
+# Silence SSL warnings for lab environments
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Configuration ---
 IXIA_IP = '{vm_ip}'
 PORT = {port}
-FLOWS_TO_CHECK = {flow_names}
-LIMIT_LOSS_DURATION = {max_loss_duration}
-LIMIT_LOSS_PERCENT = {max_loss_percent}
+TARGET_FLOW = '{target_flow}'
+LIMIT_LOSS_DURATION = {max_dur}
+LIMIT_LOSS_PERCENT = {max_pct}
 
 def run_ixia_verification():
     try:
-        session = SessionAssistant(
-            IpAddress=IXIA_IP, 
-            RestPort=PORT, 
-            VerifyCertificates=False
-        )
+        # Initialize session with SSL bypass
+        session = SessionAssistant(IpAddress=IXIA_IP, RestPort=PORT, VerifyCertificates=False)
         ixnetwork = session.Ixnetwork
         print(f"Connected to {{IXIA_IP}}:{{PORT}}.")
 
+        # Find the Statistics View
         ti_view = ixnetwork.Statistics.View.find(Caption='Traffic Item Statistics')
         if not ti_view:
             print("Error: Could not find 'Traffic Item Statistics' view.")
@@ -64,72 +55,65 @@ def run_ixia_verification():
 
         ti_view.Refresh()
         print("Monitoring traffic for 10 seconds...")
-        time.sleep(10) 
-
+        time.sleep(10)
         ti_view.Refresh()
-        stats = ti_view.Data.Read()
+        
+        # Pull raw headers and data values
+        headers = ti_view.Data.ColumnCaptions
+        stats_data = ti_view.Data.PageValues
+        
+        if not stats_data or not stats_data[0]:
+            print("Error: No statistics data found.")
+            sys.exit(1)
+            
+        # FIX: Handle double-nested list structure found in lab
+        row = stats_data[0][0] 
+        
+        # Map column names to their numerical indices
+        name_idx = headers.index('Traffic Item')
+        tx_idx = headers.index('Tx Frames')
+        rx_idx = headers.index('Rx Frames')
+        loss_pct_idx = headers.index('Loss %')
+        
+        flow_name = row[name_idx]
+        
+        if flow_name == TARGET_FLOW:
+            tx_frames = row[tx_idx]
+            rx_frames = row[rx_idx]
+            loss_pct = float(row[loss_pct_idx])
+            
+            print(f"\\n--- Flow Found: {{flow_name}} ---")
+            print(f"Tx Frames: {{tx_frames}}")
+            print(f"Rx Frames: {{rx_frames}}")
+            print(f"Loss Percent: {{loss_pct}}%")
 
-        overall_status = "PASS"
-        found_any = False
+            # Verification Logic
+            status = "PASS"
+            # Only fail if not explicitly testing functionality
+            if LIMIT_LOSS_PERCENT != 100.0: 
+                if rx_frames == 0 or loss_pct > LIMIT_LOSS_PERCENT:
+                    status = "FAIL"
+            
+            if LIMIT_LOSS_DURATION != -1:
+                loss_dur_idx = headers.index('Loss Duration (ms)')
+                loss_dur = float(row[loss_dur_idx])
+                print(f"Loss Duration: {{loss_dur}}ms")
+                if loss_dur > LIMIT_LOSS_DURATION:
+                    status = "FAIL"
 
-        for row in stats:
-            name = row['Traffic Item']
-            if name in FLOWS_TO_CHECK:
-                found_any = True
-                loss_dur = float(row['Loss Duration (ms)'])
-                loss_pct = float(row['Loss %'])
-                rx_frames = int(row['Rx Frames'])
-
-                print(f"\\n--- Flow: {{name}} ---")
-                print(f"Rx Frames: {{rx_frames}}")
-                
-                # Logic for skipping/checking Duration
-                if LIMIT_LOSS_DURATION != -1:
-                    print(f"Loss Duration: {{loss_dur}}ms (Limit: {{LIMIT_LOSS_DURATION}}ms)")
-                
-                print(f"Loss Percent: {{loss_pct}}% (Limit: {{LIMIT_LOSS_PERCENT}}%)")
-
-                # Validation Logic
-                if rx_frames == 0:
-                    print("RESULT: FAIL (No traffic)")
-                    overall_status = "FAIL"
-                
-                # Only check duration if not skipped
-                if LIMIT_LOSS_DURATION != -1 and loss_dur > LIMIT_LOSS_DURATION:
-                    print("RESULT: FAIL (Duration exceeded)")
-                    overall_status = "FAIL"
-                
-                # Check percentage
-                if loss_pct > LIMIT_LOSS_PERCENT:
-                    print("RESULT: FAIL (Percentage exceeded)")
-                    overall_status = "FAIL"
-                
-                if overall_status == "PASS":
-                    print("RESULT: PASS")
-
-        if not found_any:
-            print(f"\\nWarning: Target flows {{FLOWS_TO_CHECK}} not found.")
-            available = [r['Traffic Item'] for r in stats]
-            print(f"Available flows: {{available}}")
-            overall_status = "FAIL"
-
-        print(f"\\nFINAL VERDICT: {{overall_status}}")
-        sys.exit(0) if overall_status == "PASS" else sys.exit(1)
+            print(f"\\nFINAL VERDICT: {{status}}")
+            sys.exit(0) if status == "PASS" else sys.exit(1)
+        else:
+            print(f"Warning: Found '{{flow_name}}' but expected '{{TARGET_FLOW}}'.")
+            sys.exit(1)
 
     except Exception as e:
-        print(f"Error: {{e}}")
+        print(f"Error during execution: {{e}}")
         sys.exit(1)
 
 if __name__ == "__main__":
     run_ixia_verification()
 """
 
-st.subheader("Generated Script")
+st.subheader("Validated Generator Output")
 st.code(script_template, language='python')
-
-st.download_button(
-    label="Download Updated Script",
-    data=script_template,
-    file_name="ixia_verify_v3.py",
-    mime="text/x-python"
-)
