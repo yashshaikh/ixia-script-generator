@@ -3,7 +3,7 @@ import streamlit as st
 # --- UI Header ---
 st.set_page_config(page_title="Ixia Multi-Flow Generator", page_icon="⚡")
 st.title("⚡ Ixia Universal Multi-Flow Generator")
-st.markdown("Generates a version-independent script for multiple traffic items.")
+st.markdown("Generates a version-independent script for any number of traffic items.")
 
 # --- User Inputs ---
 with st.sidebar:
@@ -12,7 +12,8 @@ with st.sidebar:
     port = st.number_input("Rest Port", value=8080)
     
     st.header("2. Traffic Details")
-    num_flows = st.number_input("Number of Flows", min_value=1, max_value=20, value=1)
+    # Users can now input any number of flows
+    num_flows = st.number_input("How many flows to check?", min_value=1, max_value=100, value=1)
     
     flow_names = []
     for i in range(int(num_flows)):
@@ -21,11 +22,7 @@ with st.sidebar:
 
     st.header("3. Expectations")
     skip_dur = st.checkbox("Skip Loss Duration Check", value=True)
-    if not skip_dur:
-        max_dur = st.number_input("Max Loss Duration (ms)", value=0)
-    else:
-        max_dur = -1
-        
+    max_dur = -1 if skip_dur else st.number_input("Max Loss Duration (ms)", value=0)
     max_pct = st.number_input("Max Loss Percentage (%)", value=0.0, format="%.4f")
 
 # --- The Multi-Flow Script Template ---
@@ -53,7 +50,7 @@ def run_ixia_verification():
 
         ti_view = ixnetwork.Statistics.View.find(Caption='Traffic Item Statistics')
         ti_view.Refresh()
-        print("Monitoring traffic for 10 seconds...")
+        print(f"Monitoring {{len(FLOWS_TO_CHECK)}} flow(s) for 10 seconds...")
         time.sleep(10)
         ti_view.Refresh()
         
@@ -68,30 +65,31 @@ def run_ixia_verification():
         rows = stats_data[0] 
         
         # Map column names to their numerical indices
-        name_idx = headers.index('Traffic Item')
-        tx_idx = headers.index('Tx Frames')
-        rx_idx = headers.index('Rx Frames')
-        loss_pct_idx = headers.index('Loss %')
+        idx_map = {{
+            'name': headers.index('Traffic Item'),
+            'tx': headers.index('Tx Frames'),
+            'rx': headers.index('Rx Frames'),
+            'loss_pct': headers.index('Loss %')
+        }}
         
         overall_status = "PASS"
-        found_count = 0
+        found_flows = []
 
         for row in rows:
-            flow_name = row[name_idx]
+            flow_name = row[idx_map['name']]
             
             if flow_name in FLOWS_TO_CHECK:
-                found_count += 1
-                tx_frames = row[tx_idx]
-                rx_frames = row[rx_idx]
-                loss_pct = float(row[loss_pct_idx])
+                found_flows.append(flow_name)
+                tx_frames = row[idx_map['tx']]
+                rx_frames = row[idx_map['rx']]
+                loss_pct = float(row[idx_map['loss_pct']])
                 
-                print(f"\\n--- Flow Found: {{flow_name}} ---")
+                print(f"\\n--- Flow: {{flow_name}} ---")
                 print(f"Tx Frames: {{tx_frames}}")
                 print(f"Rx Frames: {{rx_frames}}")
                 print(f"Loss Percent: {{loss_pct}}%")
 
-                # Verification Logic
-                # If checking functionality with 100% loss, set Limit to 100.0
+                # Logic: Fail if 100% loss is not intended or if threshold exceeded
                 if LIMIT_LOSS_PERCENT != 100.0:
                     if rx_frames == 0 or loss_pct > LIMIT_LOSS_PERCENT:
                         overall_status = "FAIL"
@@ -103,8 +101,10 @@ def run_ixia_verification():
                     if loss_dur > LIMIT_LOSS_DURATION:
                         overall_status = "FAIL"
 
-        if found_count < len(FLOWS_TO_CHECK):
-            print(f"\\nWarning: Only found {{found_count}}/{{len(FLOWS_TO_CHECK)}} target flows.")
+        # Check if any requested flows were missing from the Ixia table
+        missing = set(FLOWS_TO_CHECK) - set(found_flows)
+        if missing:
+            print(f"\\nWarning: Missing flows from Ixia statistics: {{list(missing)}}")
             overall_status = "FAIL"
 
         print(f"\\nFINAL VERDICT: {{overall_status}}")
